@@ -225,7 +225,8 @@ class KD(FIFO):
     def getRanks(self):
         ranks = nx.degree(self._G, self._open)
         return ranks
-
+class BysP(KD):
+    pass
 
 class RND(KD):
 
@@ -264,43 +265,19 @@ class EC(KD):
                 return ranks
 
 
-class BysP(KD):
+class GROUPS(KD):
 
     def __init__(self, G, initialLeads):
         KD.__init__(self, G, initialLeads)
 
     def getRanks(self):
         G = self._G
-        nodes = G.nodes()
-        leads = set([v for v in nodes if G.node[v]["isLead"] == True])
-        notleads = set([v for v in nodes if G.node[v]["isLead"] == False])
-        potentials = set([v for v in nodes if G.node[v]["isLead"] == None])
-        for v in leads:
-            NL = 0.0
-            NA = 0.0
-            ns = set(G.neighbors(v))
-            L = 1.0*len(ns & leads)
-            NL = 1.0*len(ns & notleads)
-            NA = 1.0*len(ns & potentials)
-            G.node[v]["promise"] = self._getPromiseFactor(L, NL)
-            ranks = {}
-            openList = self._open.copy()
-            for v in openList:
-                ns = set(G.neighbors(v))
-                # assert all neighbors are leads
-                assert len(ns) == len(ns & leads)
-                P = 1.0 - \
-                    reduce(operator.mul, [1.0 - G.node[l]["promise"]
-                           for l in ns], 1)
-                G.node[v]["promising"] = P
-                ranks[v] = P
-                return ranks
+        ranks = {}
+        openList = self._open.copy()
+        for v in openList:
+            ranks[v] = G.node[v]["groups"]
+        return ranks
 
-    def _getPromiseFactor(self, L, NL):
-        if L+NL > 0:
-            return L / (L+NL)
-        else:
-            return 0.5
 
 
 class eGreedyBysP(BysP, RND):
@@ -1244,12 +1221,16 @@ def updateInformationList(initialGraph, visibleG, groupsFound):
     for v in initialGraph:
         updateInformation(v, visibleG, groupsFound)
 
+def updateGroupStats(v, visibleG, G):
+    "Update the number of groups"
+    visibleG.node[v]["groups"] = len(set(G.neighbors(v)))
 
 def updateInformation(v, visibleG, groupsFound):
     """ updates the information by pulling profile v"""
     visibleG.add_node(v)
     newGroups = discover_neighbors(G, visibleG, v, CLOSED)
     groupsFound.update(newGroups)
+    updateGroupStats(v,visibleG,G)
     if newGroups is None:
         return
     newProfiles = [
@@ -1257,29 +1238,7 @@ def updateInformation(v, visibleG, groupsFound):
     OPEN.addall(newProfiles, v, True)
 
 
-#
-#    Logging definitions
-#
-logInstancesEnabled = True
-logGraphEnabled = True
-graphLogsDir = "graphsData"
-instancesLogDir = "dataSets"
-
-if logInstancesEnabled:
-    if not os.path.exists(instancesLogDir):
-        os.makedirs(instancesLogDir)
-
-if logGraphEnabled:
-    if not os.path.exists(graphLogsDir):
-        os.makedirs(graphLogsDir)
-
 loggingDeltaTime = 1
-
-#
-#    Instance Logging
-#
-
-algo = [PL, PNL, PP, AvgP, BysP, CC, EC, KD, MaxP, UCB]
 
 
 def createPotentialInstances(potential, visibleGraph, reqestCount):
@@ -1464,8 +1423,6 @@ for section in sections:
                     reqestCount = 0
                     T = time.time()
                     stats["alg"] = open_class.__name__+str(execution)
-                    leadsFound = []
-                    notLeads = []
                     groupsFound = set([])
                     initialProfiles = [
                         gg for g in initialGroups for gg in G.neighbors(g)]
@@ -1475,6 +1432,8 @@ for section in sections:
                     visibleG = G.subgraph(initialProfiles + initialGroups)
                     CLOSED = set([])
                     OPEN = open_class(visibleG, initialRepresentatives)
+                    for v in initialRepresentatives:
+                        updateGroupStats(v, visibleG, G)
                     updateInformationList(
                         initialRepresentatives, visibleG, groupsFound)
                     instancesSet = {}
