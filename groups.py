@@ -148,13 +148,12 @@ def stored_graphs(condition):
 
 class FIFO():
 
-    def __init__(self, vG, initialLeads):
+    def __init__(self, vG, initialOpen):
         self._G = vG
         self._open = set([])
         self._queue = {}
         self._i = 0
-        self._initialLeads = list(initialLeads)
-        self.addall(initialLeads, None, None)
+        self.addall(initialOpen, None)
 
     def __len__(self):
         return len(self._open)
@@ -177,10 +176,6 @@ class FIFO():
                 return None
 
     def next(self):
-        # Initial leads must be expanded first
-        initial_lead = self._get_initial_lead()
-        if initial_lead is not None:
-            return initial_lead
         if len(self._open) == 0:
             raise StopIteration()
         else:
@@ -197,7 +192,7 @@ class FIFO():
                 del self._queue[k]
             return v, k
 
-    def addall(self, discovered, v, v_is_lead):
+    def addall(self, discovered, v):
         discovered = set(discovered)
         discovered.difference_update(self._open)
         self._i -= 1
@@ -207,10 +202,10 @@ class FIFO():
 
 class KD(FIFO):
 
-    def __init__(self, vG, initialLeads):
-        FIFO.__init__(self, vG, initialLeads)
+    def __init__(self, vG, initialOpen):
+        FIFO.__init__(self, vG, initialOpen)
 
-    def addall(self, discovered, v, v_is_lead):
+    def addall(self, discovered, v):
         self._open.update(discovered)
         self.requeue()
 
@@ -230,53 +225,46 @@ class BysP(KD):
 
 class RND(KD):
 
-    def __init__(self, G, initialLeads):
-        KD.__init__(self, G, initialLeads)
+    def __init__(self, G, initialOpen):
+        KD.__init__(self, G, initialOpen)
 
     def getRanks(self):
         ranks = dict([(v, random.random()) for v in self._open])
         return ranks
 
 
-class CC(KD):
-
-    def __init__(self, G, initialLeads):
-        KD.__init__(self, G, initialLeads)
-
-    def addall(self, discovered, v, v_is_lead):
-        if len(discovered) > 0:
-            KD.addall(self, discovered, v, v_is_lead)
-
-    def getRanks(self):
-        ranks = nx.clustering(self._G, self._open)
-        return ranks
-
-
-class EC(KD):
-
-    def __init__(self, G, initialLeads):
-        KD.__init__(self, G, initialLeads)
-
-    def getRanks(self):
-        ranks = {}
-        for v, k in nx.eigenvector_centrality(self._G, max_iter=100, tol=1.0).items():
-            if v in self._open:
-                ranks[v] = k
-                return ranks
-
 
 class GROUPS(KD):
 
-    def __init__(self, G, initialLeads):
-        KD.__init__(self, G, initialLeads)
+    def __init__(self, G, initialOpen):
+        KD.__init__(self, G, initialOpen)
+
+    def _visitsPerArm(self,setOfGroups,visibleG):
+        neighbors= set.intersection(*[visibleG.neighbors(g) for g in setOfGroups])
+        visits=len(neighbors - set([p for p in neighbors if visibleG.neighbors(p) != setOfGroups]))
+        return visits
+
+    def _averagePerArm(self,setOfGroups):
+        pass
+
+
+    def scoreOfArm(self,setOfGroups):
+        visits = self._visitsPerArm(setOfGroups)
+        average = self._averagePerArm(setOfGroups)
+        return banditFormula(visits,average)
 
     def getRanks(self):
         G = self._G
         ranks = {}
         openList = self._open.copy()
         for v in openList:
-            ranks[v] = G.node[v]["groups"]
+            groups = G.neighbors(v)
+            score=0
+            for g in groups:
+                score+=G.node[g]["groups"]/G.node[g]["flips"]
+            ranks[v] = score
         return ranks
+
 
 
 
@@ -483,13 +471,6 @@ class UCB_NORESET(UCB):
             self.hits[l] = self.hits.get(l, 0) + 1
 
 
-def print_lead_data(leads, G, name):
-    print "************* " + name + "********************"
-    for l in sorted(leads):
-        print "p:"+str(G.node[l]["promise"]) + " x:" + str(G.node[l]["exploration"])
-        print "********************************************"
-
-
 class UCB_ADD(UCB):
 
     """ Looks at the sum of all neighbors (superarms) """
@@ -550,113 +531,6 @@ class UCB_COM(UCB):
         for v in self.exploration:
             self.exploration[v] = self._getXplorationFactor(
                 self.exploration[v], total_pulls)
-
-
-class UCB_COM_RESET(UCB):
-
-    """ The COM version that gurantees regret"""
-
-    def __init__(self, G, initialLeads):
-        self.arm_hits = {}
-        self.total_pulls = 0
-        UCB.__init__(self, G, initialLeads)
-
-    def _getCp(self):
-        cp = 1.0  # 0.5#max(self.exploitation.values()+[0])
-        return cp
-
-    def addall(self, discovered, v, v_is_lead):
-        UCB.addall(self, discovered, v, v_is_lead)
-        if v is None:
-            return
-        ns = set(G.neighbors(v))
-        ns &= set(
-            [v for v in self._G.nodes() if self._G.node[v]["isLead"] == True])
-        if not len(ns):
-            return
-        ns = tuple(sorted(ns))
-        if ns not in self.arm_hits:
-            self.arm_hits[ns] = [self.total_pulls, 0]
-            self.arm_hits[ns][1] += 1
-            self.total_pulls += 1
-
-    def getRankOfArm(self, G, ns):
-        ns = tuple(sorted(ns))
-        P = 1.0 - reduce(operator.mul, [1.0 - G.node[l]["promise"]
-                         for l in ns], 1)
-        if ns in self.arm_hits:
-            return P + len(ns)*self.exploration[ns]
-        else:
-            return P
-
-    def calculateExploitationValues(self, G, leads, notleads, potentials):
-        self._leads = leads
-        for l in leads:
-            ns = set(G.neighbors(l))
-            if not len(ns):
-                continue
-            L = 1.0*len(ns & leads)
-            NL = 1.0*len(ns & notleads)
-            G.node[l]["promise"] = self._getPromiseFactor(L, NL)
-            # Detect new arms
-            #        openList=self._open.copy()
-            #        for v in openList:
-            #            ns = tuple(sorted(set(G.neighbors(v))))
-            #            if not len(ns): continue
-            #            if ns not in self.arm_hits:
-            #                self.arm_hits[ns] = [self.total_pulls,1]
-
-#    def calculateExploitationValues(self, G, leads, notleads, potentials):
-#        openList=self._open.copy()
-#        nodes = G.nodes()
-#        self.exploitation={}
-#        self.exploration={}
-#        self._leads = leads
-#        for v in openList:
-#            ns = set(G.neighbors(v))
-#            if not len(ns): continue
-#            assert len(ns) == len(ns & leads)
-#            ns=tuple(sorted(ns))
-#            if ns in self.exploitation: continue
-#            ns_of_group=set(nodes)
-#            for l in ns:
-#                l_ns = set(G.neighbors(l))
-#                l_L  = 1.0*len(l_ns & leads)
-#                l_NL = 1.0*len(l_ns & notleads)
-#                G.node[l]["promise"] = self._getPromiseFactor(l_L, l_NL)
-#                ns_of_group = l_ns & ns_of_group
-#            L  = 1.0*len(ns_of_group & leads)
-#            NL = 1.0*len(ns_of_group & notleads)
-#            self.exploitation[ns] = self._getPromiseFactor(L, NL)
-# Detect new arms
-#            if ns not in self.hits:
-#                self.arm_hits[ns] = [self.total_pulls,1]
-
-    def calculateExplorationValues(self, G, leads, v, notleads):
-        self.exploration = {}
-        for v in self.arm_hits:
-            self.exploration[v] = self._getXplorationFactor(
-                self.arm_hits[v][1], self.total_pulls-self.arm_hits[v][0])
-
-
-def arms_stat_begin():
-    #fieldnames = "arm", "creationTime","hits", "potentials", "leads","non_leads"
-    fieldnames = "hits", "opt_len", "opt_potentials", "opt_leads", "opt_noleads", "opt_exploitation", "opt_mu", "opt_bysp", "opt_exploration", "sel_len", "sel_potentials", "sel_leads", "sel_noleads", "sel_exploitation", "sel_mu", "sel_bysp", "sel_exploration", "num_arms", "num_dead", "num_new", "is_opt", "sel_hits", "leads", "notleads"
-    armf = csv.DictWriter(file("arms_%s.csv", "w"),
-                          fieldnames, "", lineterminator="\n")
-    armf.writerow(dict(zip(fieldnames, fieldnames)))
-    return armf
-
-
-def neighborsOfArm(G, arm):
-    if len(arm) == 0:
-        return set([])
-    ns = set(G.nodes())
-    for l in arm:
-        ns &= set(G.neighbors(l))
-        otherLeads = set([ol for ol in leadsFound if ol not in arm])
-        ns = set([n for n in ns if len(set(G.neighbors(n)) & otherLeads) == 0])
-        return ns
 
 
 class SN_UCB(UCB):
@@ -872,65 +746,6 @@ class OPT_ARM(SN_UCB):
                         self, G, leads, notleads, potentials)
 
 
-class SN_UCB_TIEBREAK_PLEADS(SN_UCB):
-
-    """ Tie breaking according BysP  """
-
-    def getRanks(self):
-        ranks = SN_UCB.getRanks(self)
-        if None in ranks.values() or len(ranks) == 0:
-            return ranks
-        G = self._G
-        nodes = G.nodes()
-        leads = set([v for v in nodes if G.node[v]["isLead"] == True])
-        notleads = set([v for v in nodes if G.node[v]["isLead"] == False])
-        potentialleads = set([v for v in nodes if G.node[v]["isLead"] == None])
-        for v in leads:
-            ns = set(G.neighbors(v))
-            L = 1.0*len(ns & leads)
-            NL = 1.0*len(ns & notleads)
-            G.node[v]["promise"] = self._getPromiseFactor(L, NL)
-            maxRank = max(ranks.values())
-            maxItems = [r for r in ranks if ranks[r] == maxRank]
-            if maxRank == float('inf'):
-                maxRank = max(
-                    [r for r in ranks.values() if r != maxRank]+[0.0])
-                for mi in maxItems:
-                    ns = set(G.neighbors(mi))
-                    pleads = neighborsOfArm(G, ns) & potentialleads
-                    ranks[mi] = maxRank+(potentialleads - len(pleads))
-                    return ranks
-
-
-class SN_UCB_TIEBREAK_KD(SN_UCB):
-
-    """ Tie breaking according BysP  """
-
-    def getRanks(self):
-        ranks = SN_UCB.getRanks(self)
-        if None in ranks.values() or len(ranks) == 0:
-            return ranks
-        G = self._G
-        nodes = G.nodes()
-        leads = set([v for v in nodes if G.node[v]["isLead"] == True])
-        notleads = set([v for v in nodes if G.node[v]["isLead"] == False])
-        for v in leads:
-            ns = set(G.neighbors(v))
-            L = 1.0*len(ns & leads)
-            NL = 1.0*len(ns & notleads)
-            G.node[v]["promise"] = self._getPromiseFactor(L, NL)
-            maxRank = max(ranks.values())
-            maxItems = [r for r in ranks if ranks[r] == maxRank]
-            if maxRank == float('inf'):
-                maxRank = max(
-                    [r for r in ranks.values() if r != maxRank]+[0.0])
-                for mi in maxItems:
-                    ns = set(G.neighbors(mi))
-                    #P = 1.0 - reduce(operator.mul,[1.0 - G.node[l]["promise"] for l in ns],1)
-                    ranks[mi] = maxRank+len(ns)
-                    return ranks
-
-
 class UCB_COM_BysP(UCB_COM):
 
     def _getCp(self):
@@ -940,18 +755,6 @@ class UCB_COM_BysP(UCB_COM):
         P = 1.0 - reduce(operator.mul, [1.0 - G.node[l]["promise"]
                          for l in ns], 1)
         return P
-
-
-class UCB_COM5(UCB_COM):
-
-    def _getCp(self):
-        return UCB_COM._getCp(self)*5.0
-
-
-class UCB_COM05(UCB_COM):
-
-    def _getCp(self):
-        return UCB_COM._getCp(self)*0.5
 
 
 class UCT(UCB):
@@ -1101,247 +904,33 @@ class MaxP(KD):
             return 0.5
 
 
-class SMOOTHED_PROMISING(BysP):
-
-    def __init__(self, G, initialLeads):
-        PROMISING.__init__(self, G, initialLeads)
-
-    def _getPromiseFactor(self, L, NL, NA):
-        if L+NL > 0:
-            return (L+1) / (L+NL+1)
-        else:
-            return 0.5
-
-
-class PL(KD):
-
-    def __init__(self, G, initialLeads):
-        KD.__init__(self, G, initialLeads)
-
-    def getRanks(self):
-        G = self._G
-        nodes = G.nodes()
-        leads = set([v for v in nodes if G.node[v]["isLead"] == True])
-        notleads = set([v for v in nodes if G.node[v]["isLead"] == False])
-        potentials = set([v for v in nodes if G.node[v]["isLead"] == None])
-        for v in leads:
-            ns = set(G.neighbors(v))
-            L = 1.0*len(ns & leads)
-            if(len(ns) == 0):
-                G.node[v]["LConnected"] = 0
-            else:
-                G.node[v]["LConnected"] = float(L)/float(len(ns))
-                ranks = {}
-                openList = self._open.copy()
-                for v in openList:
-                    ns = set(G.neighbors(v))
-                    # assert all neighbors are leads
-                    assert len(ns) == len(ns & leads)
-                    PL = sum(G.node[l]["LConnected"] for l in ns)
-                    if(len(ns) == 0):
-                        ranks[v] = 0
-                    else:
-                        ranks[v] = float(PL) / float(len(ns))
-                        return ranks
-
-
-class PNL(KD):
-
-    def __init__(self, G, initialLeads):
-        KD.__init__(self, G, initialLeads)
-
-    def getRanks(self):
-        G = self._G
-        nodes = G.nodes()
-        leads = set([v for v in nodes if G.node[v]["isLead"] == True])
-        notleads = set([v for v in nodes if G.node[v]["isLead"] == False])
-        potentials = set([v for v in nodes if G.node[v]["isLead"] == None])
-        for v in leads:
-            NL = 0.0
-            ns = set(G.neighbors(v))
-            NL = 1.0*len(ns & notleads)
-            if(len(ns) == 0):
-                G.node[v]["NLConnected"] = 0
-            else:
-                G.node[v]["NLConnected"] = float(NL)/float(len(ns))
-                ranks = {}
-                openList = self._open.copy()
-                for v in openList:
-                    ns = set(G.neighbors(v))
-                    # assert all neighbors are leads
-                    assert len(ns) == len(ns & leads)
-                    PNL = sum(G.node[l]["NLConnected"] for l in ns)
-                    if(len(ns) == 0):
-                        ranks[v] = 0
-                    else:
-                        ranks[v] = float(PNL) / float(len(ns))
-                        return ranks
-
-
-class PP(KD):
-
-    def __init__(self, G, initialLeads):
-        KD.__init__(self, G, initialLeads)
-
-    def getRanks(self):
-        G = self._G
-        nodes = G.nodes()
-        leads = set([v for v in nodes if G.node[v]["isLead"] == True])
-        notleads = set([v for v in nodes if G.node[v]["isLead"] == False])
-        potentials = set([v for v in nodes if G.node[v]["isLead"] == None])
-        for v in leads:
-            NA = 0.0
-            ns = set(G.neighbors(v))
-            NA = 1.0*len(ns & potentials)
-            if(len(ns) == 0):
-                G.node[v]["PPConnected"] = 0
-            else:
-                G.node[v]["PPConnected"] = float(NA)/float(len(ns))
-                ranks = {}
-                openList = self._open.copy()
-                for v in openList:
-                    ns = set(G.neighbors(v))
-                    # assert all neighbors are leads
-                    assert len(ns) == len(ns & leads)
-                    PP = sum(G.node[l]["PPConnected"] for l in ns)
-                    if(len(ns) == 0):
-                        ranks[v] = 0
-                    else:
-                        ranks[v] = float(PP) / float(len(ns))
-                        return ranks
-
-
 def getGroups(G, p):
     """Find the groups for profile p"""
     return G.neighbors(p)
-
-
-def updateInformationList(initialGraph, visibleG, groupsFound):
-    """ updates the information of vertices in initialGraph """
-    for v in initialGraph:
-        updateInformation(v, visibleG, groupsFound)
-
-def updateGroupStats(v, visibleG, G):
-    "Update the number of groups"
-    visibleG.node[v]["groups"] = len(set(G.neighbors(v)))
 
 def updateInformation(v, visibleG, groupsFound):
     """ updates the information by pulling profile v"""
     visibleG.add_node(v)
     newGroups = discover_neighbors(G, visibleG, v, CLOSED)
     groupsFound.update(newGroups)
-    updateGroupStats(v,visibleG,G)
+    for ng in newGroups:
+        if not hasattr(visibleG.node[ng],"groups"):
+            visibleG.node[ng]["groups"]=0
+        else:
+            visibleG.node[ng]["groups"]+=(len(newGroups)-1)
+        if not hasattr(visibleG.node[ng],"flips"):
+            visibleG.node[ng]["flips"]=1
+        else:
+            visibleG.node[ng]["flips"]+=1
     if newGroups is None:
         return
     newProfiles = [
         p for g in newGroups for p in discover_neighbors(G, visibleG, g, CLOSED)]
-    OPEN.addall(newProfiles, v, True)
-
-
-loggingDeltaTime = 1
-
-
-def createPotentialInstances(potential, visibleGraph, reqestCount):
-    res = {}
-    for a in algo:
-        tmp = a(visibleGraph, potential)
-        algoRank = tmp.getRanks()
-        for id in algoRank:
-            if id in res:
-                res[id] = res[id]+[algoRank[id]]
-            else:
-                res[id] = [algoRank[id]]
-                for id in algoRank:
-                    res[id] = [reqestCount]+res[id]
-                    return res
-
-
-def logInstances(target, OPEN, G, instancesSet):
-    with open(instancesLogDir+'\\'+target+'_'+OPEN.__class__.__name__+'.csv', 'wb') as csvfile:
-        writer = csv.writer(csvfile, delimiter=',')
-        nodes = G.nodes()
-        leads = set([v for v in nodes if G.node[v]["isLead"] == True])
-        notleads = set([v for v in nodes if G.node[v]["isLead"] == False])
-        for cycle in instancesSet:
-            for instanceId in instancesSet[cycle]:
-                # post-process the results
-                assert (instanceId in leads) or (instanceId in notleads)
-                if instanceId in leads:
-                    instancesSet[cycle][instanceId] = instancesSet[
-                        cycle][instanceId]+['1']
-                else:
-                    instancesSet[cycle][instanceId] = instancesSet[
-                        cycle][instanceId]+['0']
-                    # write the results to file
-                    writer.writerow(instancesSet[cycle][instanceId])
-
-#
-#    Graph Logging
-#
-graphLoggingHeader = [
-    "#Iteration", "Lcount", "NLcount", "PLcount", "nodeCount", "edgeCount", "density",
-    "numberC", "avgC", "giantC", "clusteringCoef", "CC_target", "Betweeness", "Lratio", "NLratio", "PLratio"]
-
-
-def createGraphInstance(visibleG, reqestCount, targetID):
-    stats = {}
-    stats["#Iteration"] = reqestCount
-    cG = visibleG.copy()
-    cG.add_node(targetID)
-    edges = []
-    nodes = visibleG.nodes()
-    leads = set([v for v in nodes if visibleG.node[v]["isLead"] == True])
-    notLeads = set([v for v in nodes if visibleG.node[v]["isLead"] == False])
-    potentialLeads = set(nodes) - leads - notLeads
-    stats["Lcount"] = len(leads)
-    stats["NLcount"] = len(notLeads)
-    stats["PLcount"] = len(potentialLeads)
-
-    stats["Lratio"] = float(len(leads))/len(nodes)
-    stats["NLratio"] = float(len(notLeads))/len(nodes)
-    stats["PLratio"] = float(len(potentialLeads))/len(nodes)
-
-    n = cG.number_of_nodes()
-    m = cG.number_of_edges()
-    d = float(m)/float(n)
-
-    stats["nodeCount"] = n
-    stats["edgeCount"] = m
-    stats["density"] = d
-
-    comps = nx.connected_components(cG)
-    comps = [len(comp) for comp in comps]
-
-    stats["numberC"] = len(comps)
-    stats["avgC"] = sum(comps)/len(comps)
-    stats["giantC"] = max(comps)
-    stats["clusteringCoef"] = nx.algorithms.cluster.average_clustering(cG)
-
-    stats['CC_target'] = nx.clustering(cG, targetID)
-    stats['Betweeness'] = nx.betweenness_centrality(cG)[targetID]
-    return stats
-
-
-def logGraph(targetID, OPEN, graphSet):
-    with open(graphLogsDir+'\\'+targetID+'_'+OPEN.__class__.__name__+'.csv', 'wb') as csvfile:
-        writer = csv.writer(csvfile, delimiter=',')
-        if(len(graphSet) == 0):
-            writer.writerow('No valid reults')
-            return
-        else:
-            # writer.writerow(graphLoggingHeader)
-            iterations = graphSet.keys()
-            for i in sorted(iterations, key=lambda(x): int(x)):
-                iterationData = graphSet[i]
-                output = []
-                for h in graphLoggingHeader:
-                    output += [iterationData[h]]
-                    writer.writerow(output)
+    OPEN.addall(newProfiles, v)
 
 
 #
 # START
-# {id,reqestCount,PL,PNL,PP,AvgP,BysP,CC,EC,KD,MaxP,UCB}
 ini = pyini.ConfigParser()
 hasini = False
 if len(sys.argv) >= 2:
@@ -1381,7 +970,7 @@ for section in sections:
         ini, section, "executions", "List of executions:")
     initials = prompt_for_option(
         ini, section, "initialGroups", "initialGroups:")
-    fieldnames = "source", "targetID", "n", "m", "density", "numberC", "avgC", "giantC", "clusteringCoef", "totalLeads", "alg", "initialSeeds", "open", "closed", "profileID", "heuristic", "lastIsLead", "IsLeadRequestsNum", "groupsFound", "notleadsFound", "time"
+    fieldnames = "source", "n", "m", "density", "numberC", "avgC", "giantC", "clusteringCoef", "alg", "initialSeeds", "open", "closed", "profileID", "heuristic", "requestsNum", "groupsFound", "time"
     resultf = csv.DictWriter(
         file(str(resultfileprefix) + str(gethostname())+"_%d.csv" %
              time.time(), "w"), fieldnames, "", lineterminator="\n")
@@ -1398,7 +987,6 @@ for section in sections:
             assert isinstance(G, nx.Graph)
             stats["initialSeeds"] = seed_count
             stats["source"] = section
-            stats["targetID"] = 'NA'
             G_notarget = G.copy()
             n = G.number_of_nodes()
             m = G.number_of_edges()
@@ -1413,8 +1001,6 @@ for section in sections:
             stats["giantC"] = max(comps)
             stats[
                 "clusteringCoef"] = nx.algorithms.cluster.average_clustering(G)
-            stats["totalLeads"] = 'NA'
-            stats["lastIsLead"] = 'NA'
             random.seed(0)
             initialGroups = initials
             for OPEN in heuristics:
@@ -1423,28 +1009,14 @@ for section in sections:
                     reqestCount = 0
                     T = time.time()
                     stats["alg"] = open_class.__name__+str(execution)
-                    groupsFound = set([])
+                    groupsFound = set(initialGroups)
                     initialProfiles = [
                         gg for g in initialGroups for gg in G.neighbors(g)]
-                    """Currently a single profile from each group"""
-                    initialRepresentatives = [random.choice(G.neighbors(g))
-                                              for g in initialGroups]
                     visibleG = G.subgraph(initialProfiles + initialGroups)
                     CLOSED = set([])
-                    OPEN = open_class(visibleG, initialRepresentatives)
-                    for v in initialRepresentatives:
-                        updateGroupStats(v, visibleG, G)
-                    updateInformationList(
-                        initialRepresentatives, visibleG, groupsFound)
-                    instancesSet = {}
-                    graphSet = {}
-                    if isLogEnabled():
-                        if logInstancesEnabled & (reqestCount % loggingDeltaTime == 0):
-                            instancesSet[reqestCount] = createPotentialInstances(
-                                OPEN._open, visibleG, reqestCount)  # log before running
-                        if logGraphEnabled & (reqestCount % loggingDeltaTime == 0):
-                            graphSet[reqestCount] = createGraphInstance(
-                                visibleG, reqestCount, targetID)
+                    OPEN = open_class(visibleG,initialProfiles )
+                    for p in initialProfiles:
+                        updateInformation(p, visibleG, groupsFound)
                     for v, k in OPEN:
                         CLOSED.add(v)
                         updateInformation(v, visibleG, groupsFound)
@@ -1452,25 +1024,11 @@ for section in sections:
                         stats["profileID"] = v.strip()
                         stats["heuristic"] = k
                         stats["IsLeadRequestsNum"] = reqestCount
-                        stats["notleadsFound"] = len(notLeads)
                         stats["closed"] = len(CLOSED)
                         stats["open"] = len(OPEN)
                         stats["groupsFound"] = len(groupsFound)
                         stats["time"] = time.time() - T
                         resultf.writerow(stats)
                     print OPEN.__class__.__name__+str(execution),  time.time() - T
-                    if isLogEnabled():
-                        if logInstancesEnabled & (reqestCount % loggingDeltaTime == 0):
-                            # log after network updates
-                            instancesSet[reqestCount] = createPotentialInstances(
-                                OPEN._open, visibleG, reqestCount)
-                        if logGraphEnabled & (reqestCount % loggingDeltaTime == 0):
-                            graphSet[reqestCount] = createGraphInstance(
-                                visibleG, reqestCount, targetID)
-                        if logInstancesEnabled:
-                            logInstances(targetID, OPEN,
-                                         visibleG, instancesSet)
-                        if logGraphEnabled:
-                            logGraph(targetID, OPEN, graphSet)
                     print "Done."
                     pass
