@@ -240,10 +240,16 @@ class SECS(KD):
         G = self._G
         ranks = {}
         openList = self._open.copy()
+        cache={}
         for v in openList:
             groups = G.neighbors(v)
-            sec = set.intersection(*[set(G.neighbors(g)) for g in groups])
-            flips = len(sec & self.CLOSED)
+            cacheKey="".join(groups)
+            if cacheKey in cache:
+                flips = cache[cacheKey]
+            else:
+                sec = set.intersection(*[set(G.neighbors(g)) for g in groups])
+                flips = len(sec & self.CLOSED)
+                cache[cacheKey]=flips
             ranks[v] = len(groups)/(self.constant *max(flips,1))
         return ranks
 
