@@ -10,7 +10,6 @@ import os
 import random
 import sys
 import time
-
 do_lock = False
 lockFile = '.locks'
 examine_arms = True
@@ -19,6 +18,7 @@ _isLog = {'UCB': False, 'INSTANCES': False, 'GRAPH': False, '*': False}
 
 
 def discover_neighbors(G, visibleG, v, CLOSED):
+    """ Finds the *new* neighbors, add to visibleG and return them """
     neighbors = G.neighbors(v)
     discovered = set(neighbors)
     discovered.difference_update(CLOSED)
@@ -132,7 +132,7 @@ def prompt_for_argument_lists(f, ini, section):
     return argvalues
 
 
-def stored_graphs(condition):
+def stored_graphs(graph_folder,condition):
     graphFiles = os.listdir(graph_folder)
     graphFiles = filter(condition, graphFiles)
     for f in graphFiles:
@@ -199,7 +199,6 @@ class FIFO():
         self._queue[self._i] = list(discovered)
         self._open.update(discovered)
 
-
 class KD(FIFO):
 
     def __init__(self, vG, initialOpen):
@@ -218,10 +217,78 @@ class KD(FIFO):
             self._queue[k] = nbunch
 
     def getRanks(self):
-        ranks = nx.degree(self._G, self._open)
+        G = self._G
+        ranks = {}
+        openList = self._open.copy()
+        for v in openList:
+           ranks[v] = len(G.neighbors(v))
         return ranks
 class BysP(KD):
     pass
+
+
+class SECS(KD):
+    """ SECS  approach
+    Every secs are divided by flips
+    """
+    def __init__(self, G, initialOpen):
+        self.CLOSED = set([])
+        self.constant = 1
+        KD.__init__(self, G, initialOpen)
+
+    def getRanks(self):
+        G = self._G
+        ranks = {}
+        openList = self._open.copy()
+        for v in openList:
+            groups = G.neighbors(v)
+            sec = set.intersection(*[set(G.neighbors(g)) for g in groups])
+            flips = len(sec & self.CLOSED)
+            ranks[v] = len(groups)/(self.constant *max(flips,1))
+        return ranks
+
+    def addall(self, discovered, v):
+        self.CLOSED.add(v)
+        KD.addall(self,discovered,v)
+
+
+class GROUPS(KD):
+    """ Ranks according to an aggregation of the random variable of
+      the membership number of groups by a flip of each group """
+    def __init__(self, G, initialOpen):
+        self.field='membership'
+        self.flips=0 #how many flips so far
+        self.constant=50.0
+        KD.__init__(self, G, initialOpen)
+
+    def getRanks(self):
+        G = self._G
+        ranks = {}
+        openList = self._open.copy()
+        for v in openList:
+            groups = G.neighbors(v)
+            exploitations=[]
+            explorations=[]
+            for g in groups:
+                logger("GROUPS","Lookup " +g)
+                if not hasattr(G.node[g],self.field):
+                    exploitations.append(2)
+                    explorations.append(1)
+                else:
+                    exploitations.append(float(G.node[g][self.field])/G.node[g]['flips'])
+                    explorations.append(sqrt(float(log(self.flips))/G.node[g]['flips']))
+            ranks[v] = self._aggragate(exploitations,explorations)
+        return ranks
+
+    def _aggragate(self,exploitations,explorations):
+        return sum([wi + self.constant*ti for wi,ti in zip(exploitations,explorations)])
+
+
+    def addall(self, discovered, v):
+        KD.addall(self,discovered,v)
+        self.flips+=1
+
+
 
 class RND(KD):
 
@@ -232,46 +299,8 @@ class RND(KD):
         ranks = dict([(v, random.random()) for v in self._open])
         return ranks
 
-
-
-class GROUPS(KD):
-
-    def __init__(self, G, initialOpen):
-        KD.__init__(self, G, initialOpen)
-
-    def _visitsPerArm(self,setOfGroups,visibleG):
-        neighbors= set.intersection(*[visibleG.neighbors(g) for g in setOfGroups])
-        visits=len(neighbors - set([p for p in neighbors if visibleG.neighbors(p) != setOfGroups]))
-        return visits
-
-    def _averagePerArm(self,setOfGroups):
-        pass
-
-
-    def scoreOfArm(self,setOfGroups):
-        visits = self._visitsPerArm(setOfGroups)
-        average = self._averagePerArm(setOfGroups)
-        return banditFormula(visits,average)
-
-    def getRanks(self):
-        G = self._G
-        ranks = {}
-        openList = self._open.copy()
-        for v in openList:
-            groups = G.neighbors(v)
-            score=0
-            for g in groups:
-                score+=G.node[g]["groups"]/G.node[g]["flips"]
-            ranks[v] = score
-        return ranks
-
-
-
-
 class eGreedyBysP(BysP, RND):
-
     """ each epsilon - explore. Otherwise take best"""
-
     def __init__(self, G, initialLeads):
         BysP.__init__(self, G, initialLeads)
 
@@ -527,7 +556,7 @@ class UCB_COM(UCB):
         # total_pulls=sum(self.exploration.values())
         nodes = G.nodes()
         total_pulls = len(
-            set([v for v in nodes if G.node[v]["isLead"] is not None]))
+            set([n for n in nodes if G.node[n]["isLead"] is not None]))
         for v in self.exploration:
             self.exploration[v] = self._getXplorationFactor(
                 self.exploration[v], total_pulls)
@@ -908,127 +937,136 @@ def getGroups(G, p):
     """Find the groups for profile p"""
     return G.neighbors(p)
 
-def updateInformation(v, visibleG, groupsFound):
-    """ updates the information by pulling profile v"""
+def updateInformation(G,v, visibleG, groupsFound, CLOSED, OPEN):
+    """ updates the information after pulling profile v"""
     visibleG.add_node(v)
-    newGroups = discover_neighbors(G, visibleG, v, CLOSED)
-    groupsFound.update(newGroups)
-    for ng in newGroups:
-        if not hasattr(visibleG.node[ng],"groups"):
-            visibleG.node[ng]["groups"]=0
+    membership = G.neighbors(v)
+    discoveredgroups = set(membership)
+    discoveredgroups.difference_update(groupsFound)
+    if len(discoveredgroups):
+        visibleG.add_nodes_from(discoveredgroups, isLead=None)
+    visibleG.add_edges_from(G.edges([v]))
+    groupsFound.update(discoveredgroups)
+    for ng in membership:
+        logger("GROUPS","updateing info for " + ng)
+        if not hasattr(visibleG.node[ng],"discovery"):
+            visibleG.node[ng]["discovery"]=len(discoveredgroups)
         else:
-            visibleG.node[ng]["groups"]+=(len(newGroups)-1)
+            visibleG.node[ng]["discovery"]+=len(discoveredgroups)
+        if not hasattr(visibleG.node[ng],"membership"):
+            visibleG.node[ng]["membership"]=len(membership)-1
+        else:
+            visibleG.node[ng]["membership"]+=(len(membership)-1)
         if not hasattr(visibleG.node[ng],"flips"):
             visibleG.node[ng]["flips"]=1
         else:
             visibleG.node[ng]["flips"]+=1
-    if newGroups is None:
+    if discoveredgroups is None:
         return
     newProfiles = [
-        p for g in newGroups for p in discover_neighbors(G, visibleG, g, CLOSED)]
+        p for g in discoveredgroups for p in discover_neighbors(G, visibleG, g, CLOSED)]
     OPEN.addall(newProfiles, v)
 
 
-#
 # START
-ini = pyini.ConfigParser()
-hasini = False
-if len(sys.argv) >= 2:
-    if len(sys.argv[1]) > 0:
-        hasini = True
-        ini.read(sys.argv[1])
-
-if not hasini:
-    inifile = os.path.basename(sys.argv[0])
-    inifile += ".ini"
-    if os.path.exists(inifile):
-        ini.read(inifile)
-        hasini = True
-        sections = ini.sections()
-        if len(sections) == 0:
-            sections = [pyini.DEFAULTSECT]
-
-print sections
-for section in sections:
-    print section
-    resultfileprefix = get_option(
-        ini, section, "output_file_prefix", str(section))
-    graph_name_prefix = prompt_for_raw_option(
-        ini, section, "graph_name_prefix", "Enter network name prefix (not a path):")
-    graph_folder = prompt_for_raw_option(
-        ini, section, "graph_folder", "Enter network folder path:")
-    goal = prompt_for_option(ini, section, "goal", "Goal ]:")
-    net_gen = stored_graphs(lambda x: x.endswith(".csv")
-                            and (not x.startswith(resultfileprefix)))
-    seed_counts = prompt_for_option(
-        ini, section, "seed_counts", "List the seed counts [int [,int [...]]]:")
-    domain = prompt_for_option(
-        ini, section, "domain", "List the Domain[tonic/comm]:")
-    heuristics = prompt_for_option(
-        ini, section, "heuristics", "List the heuristics:")
-    executions = prompt_for_option(
-        ini, section, "executions", "List of executions:")
-    initials = prompt_for_option(
-        ini, section, "initialGroups", "initialGroups:")
-    fieldnames = "source", "n", "m", "density", "numberC", "avgC", "giantC", "clusteringCoef", "alg", "initialSeeds", "open", "closed", "profileID", "heuristic", "requestsNum", "groupsFound", "time"
-    resultf = csv.DictWriter(
-        file(str(resultfileprefix) + str(gethostname())+"_%d.csv" %
-             time.time(), "w"), fieldnames, "", lineterminator="\n")
-    resultf.writeheader()
-    stats = {}
-    for seed_count in seed_counts:
-        tcount = 0
-        for G in net_gen:
-            if do_lock:
-                if register(lockFile, resultfileprefix+section+'\n'):
-                    continue
-            tcount += 1
-            print tcount
-            assert isinstance(G, nx.Graph)
-            stats["initialSeeds"] = seed_count
-            stats["source"] = section
-            G_notarget = G.copy()
-            n = G.number_of_nodes()
-            m = G.number_of_edges()
-            d = m/n
-            stats["n"] = n
-            stats["m"] = m
-            stats["density"] = d
-            comps = nx.connected_components(G_notarget)
-            comps = [len(comp) for comp in comps]
-            stats["numberC"] = len(comps)
-            stats["avgC"] = sum(comps)/len(comps)
-            stats["giantC"] = max(comps)
-            stats[
-                "clusteringCoef"] = nx.algorithms.cluster.average_clustering(G)
-            random.seed(0)
-            initialGroups = initials
-            for OPEN in heuristics:
-                open_class = OPEN
-                for execution in executions:
-                    reqestCount = 0
-                    T = time.time()
-                    stats["alg"] = open_class.__name__+str(execution)
-                    groupsFound = set(initialGroups)
-                    initialProfiles = [
-                        gg for g in initialGroups for gg in G.neighbors(g)]
-                    visibleG = G.subgraph(initialProfiles + initialGroups)
-                    CLOSED = set([])
-                    OPEN = open_class(visibleG,initialProfiles )
-                    for p in initialProfiles:
-                        updateInformation(p, visibleG, groupsFound)
-                    for v, k in OPEN:
-                        CLOSED.add(v)
-                        updateInformation(v, visibleG, groupsFound)
-                        reqestCount = reqestCount+1
-                        stats["profileID"] = v.strip()
-                        stats["heuristic"] = k
-                        stats["IsLeadRequestsNum"] = reqestCount
-                        stats["closed"] = len(CLOSED)
-                        stats["open"] = len(OPEN)
-                        stats["groupsFound"] = len(groupsFound)
-                        stats["time"] = time.time() - T
-                        resultf.writerow(stats)
-                    print OPEN.__class__.__name__+str(execution),  time.time() - T
-                    print "Done."
-                    pass
+def main():
+    ini = pyini.ConfigParser()
+    hasini = False
+    if len(sys.argv) >= 2:
+        if len(sys.argv[1]) > 0:
+            hasini = True
+            ini.read(sys.argv[1])
+    if not hasini:
+        inifile = os.path.basename(sys.argv[0])
+        inifile += ".ini"
+        if os.path.exists(inifile):
+            ini.read(inifile)
+            hasini = True
+            sections = ini.sections()
+            if len(sections) == 0:
+                sections = [pyini.DEFAULTSECT]
+    print sections
+    for section in sections:
+        print section
+        resultfileprefix = get_option(
+            ini, section, "output_file_prefix", str(section))
+        graph_name_prefix = prompt_for_raw_option(
+            ini, section, "graph_name_prefix", "Enter network name prefix (not a path):")
+        graph_folder = prompt_for_raw_option(
+            ini, section, "graph_folder", "Enter network folder path:")
+        goal = prompt_for_option(ini, section, "goal", "Goal ]:")
+        net_gen = stored_graphs(graph_folder,lambda x: x.endswith(".csv")
+                                and (not x.startswith(resultfileprefix)))
+        seed_counts = prompt_for_option(
+            ini, section, "seed_counts", "List the seed counts [int [,int [...]]]:")
+        domain = prompt_for_option(
+            ini, section, "domain", "List the Domain[tonic/comm]:")
+        heuristics = prompt_for_option(
+            ini, section, "heuristics", "List the heuristics:")
+        executions = prompt_for_option(
+            ini, section, "executions", "List of executions:")
+        initials = prompt_for_option(
+            ini, section, "initialGroups", "initialGroups:")
+        fieldnames = "source", "n", "m", "density", "numberC", "avgC", "giantC", "clusteringCoef", "alg", "initialSeeds", "open", "closed", "profileID", "heuristic", "requestsNum", "groupsFound", "time"
+        resultf = csv.DictWriter(
+            file(str(resultfileprefix) + str(gethostname())+"_%s.csv" %
+                section,"w"), fieldnames, "", lineterminator="\n")
+        resultf.writeheader()
+        stats = {}
+        for seed_count in seed_counts:
+            tcount = 0
+            for G in net_gen:
+                if do_lock:
+                    if register(lockFile, resultfileprefix+section+'\n'):
+                        continue
+                tcount += 1
+                print tcount
+                assert isinstance(G, nx.Graph)
+                stats["initialSeeds"] = seed_count
+                stats["source"] = section
+                G_notarget = G.copy()
+                n = G.number_of_nodes()
+                m = G.number_of_edges()
+                d = m/n
+                stats["n"] = n
+                stats["m"] = m
+                stats["density"] = d
+                comps = nx.connected_components(G_notarget)
+                comps = [len(comp) for comp in comps]
+                stats["numberC"] = len(comps)
+                stats["avgC"] = sum(comps)/len(comps)
+                stats["giantC"] = max(comps)
+                stats[
+                    "clusteringCoef"] = nx.algorithms.cluster.average_clustering(G)
+                random.seed(0)
+                initialGroups = initials
+                for OPEN in heuristics:
+                    open_class = OPEN
+                    for execution in executions:
+                        reqestCount = 0
+                        T = time.time()
+                        stats["alg"] = open_class.__name__+str(execution)
+                        groupsFound = set(initialGroups)
+                        initialProfiles = [
+                            gg for g in initialGroups for gg in G.neighbors(g)]
+                        visibleG = G.subgraph(initialProfiles + initialGroups)
+                        CLOSED = set([])
+                        random.seed(execution)
+                        OPEN = open_class(visibleG,initialProfiles)
+                        for v, k in OPEN:
+                            CLOSED.add(v)
+                            updateInformation(G,v, visibleG, groupsFound, CLOSED, OPEN)
+                            reqestCount = reqestCount+1
+                            stats["profileID"] = v.strip()
+                            stats["heuristic"] = k
+                            stats["requestsNum"] = reqestCount
+                            stats["closed"] = len(CLOSED)
+                            stats["open"] = len(OPEN)
+                            stats["groupsFound"] = len(groupsFound)
+                            stats["time"] = time.time() - T
+                            resultf.writerow(stats)
+                        print OPEN.__class__.__name__+str(execution),  time.time() - T
+                        print "Done."
+                        pass
+if __name__ == '__main__':
+    main()
